@@ -1,0 +1,18 @@
+{
+  "1499963658132914219": {
+    "enabled": true,
+    "channel_id": null,
+    "category_channels": {
+      "message_delete": 1501247222904520704,
+      "message_edit": 1501247222904520704
+    },
+    "flags": {
+      "message_delete": true,
+      "message_edit": true,
+      "member_join_leave": true,
+      "member_update": true,
+      "channel_update": true,
+      "voice_update": true
+    }
+  }
+}

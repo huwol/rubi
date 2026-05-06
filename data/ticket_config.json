@@ -1,0 +1,37 @@
+{
+  "1418093829290070059": {
+    "presets": {
+      "기본문의": {
+        "support_role_id": 1418123961572524092,
+        "category_id": 1418101117161574420,
+        "naming": "ticket-{id}"
+      },
+      "신고문의": {
+        "support_role_id": 1418123959253078026,
+        "category_id": 1418112288270844004,
+        "naming": "ticket-{id}"
+      },
+      "연합문의": {
+        "support_role_id": 1418123959840276510,
+        "category_id": 1418101117161574420,
+        "naming": "연합문의-{id}"
+      },
+      "관리진 지원": {
+        "support_role_id": 1418123956703203398,
+        "category_id": 1418101226662527036,
+        "naming": "ticket-{id}"
+      }
+    },
+    "default": "기본문의"
+  },
+  "1499963658132914219": {
+    "presets": {
+      "건의사항": {
+        "support_role_id": 1500909659689582735,
+        "category_id": 1500912591487242370,
+        "naming": "{id} {user}님의 문의"
+      }
+    },
+    "default": "default"
+  }
+}
