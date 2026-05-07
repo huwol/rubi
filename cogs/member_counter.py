@@ -13,7 +13,7 @@ from utils.storage import DATA_DIR, load_json, save_json
 
 MEMBER_COUNTER_CFG = DATA_DIR / "member_counter_config.json"
 
-DEFAULT_CATEGORY_NAME = "✦₊˚ ⌗ ୨♡୧ 2026@@@@ ₊˚✦"
+DEFAULT_CATEGORY_NAME = "✦₊˚ ⌗ ୨♡୧ 20260515 ₊˚✦"
 DEFAULT_TOTAL_TEMPLATE = " ˚₊· ૮₍♡>𖥦< ₎ა All Members :: {count} ˚₊·"
 DEFAULT_HUMAN_TEMPLATE = "˚₊· ૮₍♡>𖥦< ₎ა Members :: {count}+ ˚₊·"
 DEFAULT_BOT_TEMPLATE = "˚₊· ૮₍♡>𖥦< ₎ა Bots :: {count}"
