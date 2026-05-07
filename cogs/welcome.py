@@ -130,6 +130,8 @@ def _default_config(channel_id: Optional[int] = None) -> dict[str, Any]:
         "footer": DEFAULT_FOOTER,
         "color": DEFAULT_COLOR,
         "image_url": DEFAULT_IMAGE_URL,
+        "auto_roles_enabled": True,
+        "auto_role_ids": [],
     }
 
 
@@ -159,6 +161,35 @@ def _get_channel(guild: discord.Guild, channel_id: object) -> Optional[discord.a
     if isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.StageChannel)):
         return channel
     return None
+
+
+def _normalize_role_ids(value: object) -> list[int]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+
+    role_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in value:
+        try:
+            role_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if role_id not in seen:
+            seen.add(role_id)
+            role_ids.append(role_id)
+    return role_ids
+
+
+def _format_auto_roles(guild: discord.Guild, cfg: dict[str, Any]) -> str:
+    role_ids = _normalize_role_ids(cfg.get("auto_role_ids"))
+    if not role_ids:
+        return "설정된 자동 지급 역할 없음"
+
+    values: list[str] = []
+    for role_id in role_ids:
+        role = guild.get_role(role_id)
+        values.append(role.mention if role else f"삭제된 역할 `{role_id}`")
+    return ", ".join(values)
 
 
 class WelcomeMessageModal(discord.ui.Modal):
@@ -226,6 +257,7 @@ class WelcomeMessageModal(discord.ui.Modal):
         except WelcomeConfigError as exc:
             return await interaction.response.send_message(str(exc), ephemeral=True)
 
+        previous = self.cog.get_config(interaction.guild.id) or {}
         cfg = {
             "enabled": True,
             "channel_id": self.channel.id,
@@ -234,6 +266,8 @@ class WelcomeMessageModal(discord.ui.Modal):
             "footer": _normalize_text(self.footer.value, fallback="", limit=2048),
             "color": color_text,
             "image_url": image_url,
+            "auto_roles_enabled": bool(previous.get("auto_roles_enabled", True)),
+            "auto_role_ids": _normalize_role_ids(previous.get("auto_role_ids")),
         }
         self.cog.set_config(interaction.guild.id, cfg)
 
@@ -327,6 +361,11 @@ class Welcome(commands.Cog):
         embed.add_field(name="전송 채널", value=channel.mention if channel else "채널을 찾을 수 없음", inline=False)
         embed.add_field(name="상태", value="켜짐" if cfg.get("enabled", True) else "꺼짐", inline=True)
         embed.add_field(name="하단 이미지/GIF", value=cfg.get("image_url") or "사용 안 함", inline=False)
+        embed.add_field(
+            name="자동 지급 역할",
+            value=("켜짐 — " if cfg.get("auto_roles_enabled", True) else "꺼짐 — ") + _format_auto_roles(interaction.guild, cfg),
+            inline=False,
+        )
         embed.add_field(name="변수 목록", value="`/환영 변수` 명령어로 확인할 수 있습니다.", inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
@@ -361,6 +400,181 @@ class Welcome(commands.Cog):
 
         await interaction.response.send_message(f"✅ 테스트 환영 메시지를 {channel.mention}에 전송했습니다.", ephemeral=True)
 
+    async def _get_bot_member(self, guild: discord.Guild) -> Optional[discord.Member]:
+        if guild.me:
+            return guild.me
+        if self.bot.user is None:
+            return None
+        try:
+            return await guild.fetch_member(self.bot.user.id)
+        except discord.HTTPException:
+            return None
+
+    async def _check_auto_role(self, interaction: discord.Interaction, role: discord.Role) -> Optional[str]:
+        if interaction.guild is None:
+            return "서버에서만 사용할 수 있습니다."
+
+        if role.is_default():
+            return "`@everyone` 역할은 자동 지급 역할로 설정할 수 없습니다."
+        if role.managed:
+            return "봇/연동 서비스가 관리하는 역할은 자동 지급할 수 없습니다."
+
+        me = await self._get_bot_member(interaction.guild)
+        if me is None:
+            return "봇 멤버 정보를 확인하지 못했습니다."
+        if not me.guild_permissions.manage_roles:
+            return "봇에게 `역할 관리` 권한이 필요합니다."
+        if me.top_role <= role:
+            return f"봇의 가장 높은 역할이 {role.mention} 역할보다 위에 있어야 합니다."
+
+        if isinstance(interaction.user, discord.Member) and interaction.guild.owner_id != interaction.user.id:
+            if interaction.user.top_role <= role:
+                return f"당신의 가장 높은 역할이 {role.mention} 역할보다 위에 있어야 합니다."
+
+        return None
+
+    async def _assign_auto_roles(self, member: discord.Member, cfg: dict[str, Any]) -> None:
+        if not cfg.get("auto_roles_enabled", True):
+            return
+
+        role_ids = _normalize_role_ids(cfg.get("auto_role_ids"))
+        if not role_ids:
+            return
+
+        me = await self._get_bot_member(member.guild)
+        if me is None or not me.guild_permissions.manage_roles:
+            print(f"[welcome] auto-role skipped: missing Manage Roles permission, guild={member.guild.id}")
+            return
+
+        roles: list[discord.Role] = []
+        for role_id in role_ids:
+            role = member.guild.get_role(role_id)
+            if role is None:
+                continue
+            if role.is_default() or role.managed or me.top_role <= role:
+                continue
+            if role not in member.roles:
+                roles.append(role)
+
+        if not roles:
+            return
+
+        try:
+            await member.add_roles(*roles, reason="Welcome auto roles")
+        except discord.Forbidden:
+            print(f"[welcome] auto-role forbidden: guild={member.guild.id}, member={member.id}")
+        except discord.HTTPException as exc:
+            print(f"[welcome] auto-role failed: guild={member.guild.id}, member={member.id}, {type(exc).__name__}: {exc}")
+
+    @welcome.command(name="역할추가", description="새 멤버에게 자동으로 지급할 역할을 추가합니다.")
+    @app_commands.describe(role="입장 시 자동 지급할 역할")
+    @app_commands.rename(role="역할")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def add_auto_role(self, interaction: discord.Interaction, role: discord.Role):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        error = await self._check_auto_role(interaction, role)
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        role_ids = _normalize_role_ids(cfg.get("auto_role_ids"))
+        if role.id in role_ids:
+            return await interaction.response.send_message(
+                f"이미 {role.mention} 역할은 자동 지급 목록에 들어 있습니다.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        role_ids.append(role.id)
+        cfg["auto_role_ids"] = role_ids
+        cfg["auto_roles_enabled"] = True
+        self.set_config(interaction.guild.id, cfg)
+
+        await interaction.response.send_message(
+            f"✅ 새 멤버에게 {role.mention} 역할을 자동 지급하도록 추가했습니다.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @welcome.command(name="역할제거", description="자동 지급 역할 목록에서 역할을 제거합니다.")
+    @app_commands.describe(role="자동 지급 목록에서 제거할 역할")
+    @app_commands.rename(role="역할")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def remove_auto_role(self, interaction: discord.Interaction, role: discord.Role):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        role_ids = _normalize_role_ids(cfg.get("auto_role_ids"))
+        if role.id not in role_ids:
+            return await interaction.response.send_message(
+                f"{role.mention} 역할은 자동 지급 목록에 없습니다.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        cfg["auto_role_ids"] = [role_id for role_id in role_ids if role_id != role.id]
+        self.set_config(interaction.guild.id, cfg)
+
+        await interaction.response.send_message(
+            f"✅ {role.mention} 역할을 자동 지급 목록에서 제거했습니다.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @welcome.command(name="역할목록", description="새 멤버 자동 지급 역할 목록을 확인합니다.")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def list_auto_roles(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        embed = discord.Embed(
+            title="자동 지급 역할 목록",
+            description=_format_auto_roles(interaction.guild, cfg),
+            color=_parse_color(DEFAULT_COLOR),
+        )
+        embed.add_field(name="상태", value="켜짐" if cfg.get("auto_roles_enabled", True) else "꺼짐", inline=True)
+        embed.set_footer(text="/환영 역할추가, /환영 역할제거, /환영 역할켜기, /환영 역할끄기 명령어로 관리할 수 있습니다.")
+        await interaction.response.send_message(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @welcome.command(name="역할켜기", description="새 멤버 자동 역할 지급을 켭니다.")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def enable_auto_roles(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        cfg["auto_roles_enabled"] = True
+        cfg["auto_role_ids"] = _normalize_role_ids(cfg.get("auto_role_ids"))
+        self.set_config(interaction.guild.id, cfg)
+        await interaction.response.send_message("✅ 새 멤버 자동 역할 지급을 켰습니다.", ephemeral=True)
+
+    @welcome.command(name="역할끄기", description="새 멤버 자동 역할 지급을 끕니다.")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def disable_auto_roles(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        cfg["auto_roles_enabled"] = False
+        cfg["auto_role_ids"] = _normalize_role_ids(cfg.get("auto_role_ids"))
+        self.set_config(interaction.guild.id, cfg)
+        await interaction.response.send_message("✅ 새 멤버 자동 역할 지급을 껐습니다.", ephemeral=True)
+
+    @welcome.command(name="역할초기화", description="새 멤버 자동 지급 역할 목록을 모두 비웁니다.")
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def clear_auto_roles(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        cfg = self.get_config(interaction.guild.id) or _default_config(None)
+        cfg["auto_role_ids"] = []
+        self.set_config(interaction.guild.id, cfg)
+        await interaction.response.send_message("✅ 자동 지급 역할 목록을 모두 비웠습니다.", ephemeral=True)
+
     @welcome.command(name="끄기", description="새 멤버 환영 메시지 자동 전송을 끕니다.")
     @app_commands.checks.has_permissions(manage_guild=True)
     async def disable(self, interaction: discord.Interaction):
@@ -375,7 +589,12 @@ class Welcome(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         cfg = self.get_config(member.guild.id)
-        if not cfg or not cfg.get("enabled", True):
+        if not cfg:
+            return
+
+        await self._assign_auto_roles(member, cfg)
+
+        if not cfg.get("enabled", True):
             return
 
         channel = _get_channel(member.guild, cfg.get("channel_id"))
