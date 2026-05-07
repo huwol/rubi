@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import random
 import sqlite3
 import time
@@ -367,9 +368,21 @@ class Leveling(commands.Cog):
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _db(self):
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS level_config (
@@ -430,7 +443,7 @@ class Leveling(commands.Cog):
             conn.commit()
 
     def _get_config(self, guild_id: int) -> LevelConfig:
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute("SELECT * FROM level_config WHERE guild_id = ?", (guild_id,)).fetchone()
             if row is None:
                 conn.execute("INSERT INTO level_config (guild_id) VALUES (?)", (guild_id,))
@@ -448,7 +461,7 @@ class Leveling(commands.Cog):
             )
 
     def _get_xp(self, guild_id: int, user_id: int) -> tuple[int, int]:
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute(
                 "SELECT text_xp, voice_xp FROM levels WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
@@ -459,7 +472,7 @@ class Leveling(commands.Cog):
 
     def _get_rank(self, guild_id: int, user_id: int, rank_type: str) -> Optional[int]:
         expr = self._xp_expr(rank_type)
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute(
                 f"""
                 SELECT rank FROM (
@@ -481,7 +494,7 @@ class Leveling(commands.Cog):
         return "text_xp + voice_xp"
 
     def _is_no_xp_channel(self, guild_id: int, channel_id: int) -> bool:
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute(
                 "SELECT 1 FROM no_xp_channels WHERE guild_id = ? AND channel_id = ?",
                 (guild_id, channel_id),
@@ -493,7 +506,7 @@ class Leveling(commands.Cog):
         if not role_ids:
             return False
         placeholders = ",".join("?" for _ in role_ids)
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute(
                 f"SELECT 1 FROM no_xp_roles WHERE guild_id = ? AND role_id IN ({placeholders}) LIMIT 1",
                 [member.guild.id] + role_ids,
@@ -522,7 +535,7 @@ class Leveling(commands.Cog):
 
         col = "text_xp" if source == "text" else "voice_xp"
         now = _now_ts()
-        with self._connect() as conn:
+        with self._db() as conn:
             old_row = conn.execute(
                 "SELECT text_xp, voice_xp FROM levels WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
@@ -554,7 +567,7 @@ class Leveling(commands.Cog):
         return old_total, new_total
 
     def _message_cooldown_ok(self, guild_id: int, user_id: int, cooldown_seconds: int) -> bool:
-        with self._connect() as conn:
+        with self._db() as conn:
             row = conn.execute(
                 "SELECT last_message_at FROM levels WHERE guild_id = ? AND user_id = ?",
                 (guild_id, user_id),
@@ -714,7 +727,7 @@ class Leveling(commands.Cog):
         await self._send_levelup_message(guild, member, new_level)
 
     async def _apply_level_rewards(self, member: discord.Member, new_level: int) -> None:
-        with self._connect() as conn:
+        with self._db() as conn:
             rows = conn.execute(
                 """
                 SELECT level, role_id, remove_lower
@@ -848,7 +861,7 @@ class Leveling(commands.Cog):
         per_page = 10
         offset = (page - 1) * per_page
 
-        with self._connect() as conn:
+        with self._db() as conn:
             rows = conn.execute(
                 """
                 SELECT user_id, text_xp, voice_xp, total_xp, rank_no
@@ -1148,7 +1161,7 @@ class Leveling(commands.Cog):
         cfg = self._get_config(interaction.guild.id)
         channel = interaction.guild.get_channel(cfg.levelup_channel_id) if cfg.levelup_channel_id else None
 
-        with self._connect() as conn:
+        with self._db() as conn:
             no_channels = conn.execute(
                 "SELECT channel_id FROM no_xp_channels WHERE guild_id = ?",
                 (interaction.guild.id,),
@@ -1185,7 +1198,7 @@ class Leveling(commands.Cog):
     async def config_enabled(self, interaction: discord.Interaction, enabled: bool):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute("UPDATE level_config SET enabled = ? WHERE guild_id = ?", (1 if enabled else 0, interaction.guild.id))
             conn.commit()
@@ -1199,7 +1212,7 @@ class Leveling(commands.Cog):
     async def config_type(self, interaction: discord.Interaction, level_type: str):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute("UPDATE level_config SET level_type = ? WHERE guild_id = ?", (level_type, interaction.guild.id))
             conn.commit()
@@ -1215,7 +1228,7 @@ class Leveling(commands.Cog):
         min_xp = max(0, min(int(min_xp), 1000))
         max_xp = max(min_xp, min(int(max_xp), 1000))
         cooldown_seconds = max(0, min(int(cooldown_seconds), 86400))
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute(
                 "UPDATE level_config SET min_text_xp = ?, max_text_xp = ?, message_cooldown_seconds = ? WHERE guild_id = ?",
@@ -1235,7 +1248,7 @@ class Leveling(commands.Cog):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         xp_per_minute = max(0, min(int(xp_per_minute), 10000))
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute("UPDATE level_config SET voice_xp_per_minute = ? WHERE guild_id = ?", (xp_per_minute, interaction.guild.id))
             conn.commit()
@@ -1247,7 +1260,7 @@ class Leveling(commands.Cog):
     async def config_levelup_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute("UPDATE level_config SET levelup_channel_id = ? WHERE guild_id = ?", (channel.id, interaction.guild.id))
             conn.commit()
@@ -1261,7 +1274,7 @@ class Leveling(commands.Cog):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         message = _cut(message, 300)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("INSERT OR IGNORE INTO level_config (guild_id) VALUES (?)", (interaction.guild.id,))
             conn.execute("UPDATE level_config SET levelup_message = ? WHERE guild_id = ?", (message, interaction.guild.id))
             conn.commit()
@@ -1273,7 +1286,7 @@ class Leveling(commands.Cog):
     async def config_no_xp_channel_add(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO no_xp_channels (guild_id, channel_id) VALUES (?, ?)",
                 (interaction.guild.id, channel.id),
@@ -1287,7 +1300,7 @@ class Leveling(commands.Cog):
     async def config_no_xp_channel_remove(self, interaction: discord.Interaction, channel: discord.TextChannel):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "DELETE FROM no_xp_channels WHERE guild_id = ? AND channel_id = ?",
                 (interaction.guild.id, channel.id),
@@ -1301,7 +1314,7 @@ class Leveling(commands.Cog):
     async def config_no_xp_role_add(self, interaction: discord.Interaction, role: discord.Role):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO no_xp_roles (guild_id, role_id) VALUES (?, ?)",
                 (interaction.guild.id, role.id),
@@ -1315,7 +1328,7 @@ class Leveling(commands.Cog):
     async def config_no_xp_role_remove(self, interaction: discord.Interaction, role: discord.Role):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "DELETE FROM no_xp_roles WHERE guild_id = ? AND role_id = ?",
                 (interaction.guild.id, role.id),
@@ -1331,7 +1344,7 @@ class Leveling(commands.Cog):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         level = max(1, min(int(level), 1000))
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 """
                 INSERT INTO level_rewards (guild_id, level, role_id, remove_lower)
@@ -1350,7 +1363,7 @@ class Leveling(commands.Cog):
     async def reward_remove(self, interaction: discord.Interaction, level: int, role: discord.Role):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "DELETE FROM level_rewards WHERE guild_id = ? AND level = ? AND role_id = ?",
                 (interaction.guild.id, level, role.id),
@@ -1363,7 +1376,7 @@ class Leveling(commands.Cog):
     async def reward_show(self, interaction: discord.Interaction):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        with self._connect() as conn:
+        with self._db() as conn:
             rows = conn.execute(
                 "SELECT level, role_id, remove_lower FROM level_rewards WHERE guild_id = ? ORDER BY level ASC",
                 (interaction.guild.id,),
