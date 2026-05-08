@@ -9,6 +9,8 @@ from discord.ext import commands
 from utils.storage import DATA_DIR, load_json, save_json
 
 ROLEBTN_STORAGE = DATA_DIR / "rolebuttons_config.json"
+ROLEBTN_STORAGE = DATA_DIR / "rolebuttons_config.json"
+ROLEBTN_STATS_STORAGE = DATA_DIR / "rolebuttons_stats.json"
 
 STYLE_CHOICES = [
     app_commands.Choice(name="Primary(파랑)", value="primary"),
@@ -24,7 +26,73 @@ def to_button_style(s: Optional[str]) -> discord.ButtonStyle:
         "success": discord.ButtonStyle.success,
         "danger": discord.ButtonStyle.danger,
     }.get((s or "primary").lower(), discord.ButtonStyle.primary)
+    
+def _load_rolebtn_stats() -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    data = load_json(ROLEBTN_STATS_STORAGE, {})
+    return data if isinstance(data, dict) else {}
 
+
+def _normalize_id_list(value) -> List[int]:
+    if not isinstance(value, list):
+        return []
+    result: List[int] = []
+    for x in value:
+        try:
+            result.append(int(x))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def update_rolebtn_stats(
+    guild_id: int,
+    role_id: int,
+    user_id: int,
+    *,
+    active: bool,
+    count_total: bool = True,
+) -> Tuple[int, int]:
+    """
+    active: 현재 이 버튼으로 역할을 받은 상태인지
+    total: 한 번이라도 이 버튼을 눌러본 유저 수
+    """
+    stats = _load_rolebtn_stats()
+
+    guild_key = str(guild_id)
+    role_key = str(role_id)
+
+    guild_stats = stats.setdefault(guild_key, {})
+    role_stats = guild_stats.setdefault(role_key, {"active": [], "total": []})
+
+    active_ids = set(_normalize_id_list(role_stats.get("active")))
+    total_ids = set(_normalize_id_list(role_stats.get("total")))
+
+    uid = int(user_id)
+
+    if count_total:
+        total_ids.add(uid)
+
+    if active:
+        active_ids.add(uid)
+    else:
+        active_ids.discard(uid)
+
+    role_stats["active"] = sorted(active_ids)
+    role_stats["total"] = sorted(total_ids)
+
+    save_json(ROLEBTN_STATS_STORAGE, stats)
+
+    return len(active_ids), len(total_ids)
+
+
+def get_rolebtn_stats(guild_id: int, role_id: int) -> Tuple[List[int], List[int]]:
+    stats = _load_rolebtn_stats()
+    role_stats = stats.get(str(guild_id), {}).get(str(role_id), {})
+
+    active_ids = _normalize_id_list(role_stats.get("active"))
+    total_ids = _normalize_id_list(role_stats.get("total"))
+
+    return active_ids, total_ids
 
 class RoleButton(discord.ui.Button):
     def __init__(self, guild_id: int, role_id: int, label: str, style: discord.ButtonStyle, toggle: bool):
@@ -59,13 +127,51 @@ class RoleButton(discord.ui.Button):
         try:
             if self.toggle and has_role:
                 await member.remove_roles(role, reason="Role button toggle off")
-                return await interaction.response.send_message(f"✅ **{role.name}** 역할을 제거했습니다.", ephemeral=True)
+
+                active_count, total_count = update_rolebtn_stats(
+                    self.guild_id,
+                    self.role_id,
+                    member.id,
+                    active=False,
+                )
+
+                return await interaction.response.send_message(
+                    f"✅ **{role.name}** 역할을 제거했습니다.\n"
+                    f"현재 버튼 등록 인원: **{active_count}명**\n"
+                    f"누적 버튼 사용 인원: **{total_count}명**",
+                    ephemeral=True,
+                )
 
             if has_role:
-                return await interaction.response.send_message(f"이미 **{role.name}** 역할을 가지고 있습니다.", ephemeral=True)
+                active_count, total_count = update_rolebtn_stats(
+                    self.guild_id,
+                    self.role_id,
+                    member.id,
+                    active=True,
+                )
+
+                return await interaction.response.send_message(
+                    f"이미 **{role.name}** 역할을 가지고 있습니다.\n"
+                    f"현재 버튼 등록 인원: **{active_count}명**\n"
+                    f"누적 버튼 사용 인원: **{total_count}명**",
+                    ephemeral=True,
+                )
 
             await member.add_roles(role, reason="Role button assign")
-            return await interaction.response.send_message(f"✅ **{role.name}** 역할을 부여했습니다.", ephemeral=True)
+
+            active_count, total_count = update_rolebtn_stats(
+                self.guild_id,
+                self.role_id,
+                member.id,
+                active=True,
+            )
+
+            return await interaction.response.send_message(
+                f"✅ **{role.name}** 역할을 부여했습니다.\n"
+                f"현재 버튼 등록 인원: **{active_count}명**\n"
+                f"누적 버튼 사용 인원: **{total_count}명**",
+                ephemeral=True,
+            )
         except discord.Forbidden:
             return await interaction.response.send_message("권한 또는 역할 순서를 확인해 주세요.", ephemeral=True)
         except discord.HTTPException:
@@ -174,7 +280,78 @@ class RoleButtons(commands.Cog):
             "toggle": bool(toggle),
         })
         save_json(ROLEBTN_STORAGE, cfgs)
+        
+    @app_commands.command(name="rolebuttonstats", description="역할 버튼을 누른 인원 수를 확인합니다.")
+    @app_commands.describe(
+        role="확인할 역할입니다. 비워두면 이 서버의 모든 역할 버튼 기록을 보여줍니다.",
+        show_users="켜면 현재 버튼 등록 유저 목록도 표시합니다.",
+    )
+    @app_commands.checks.has_permissions(manage_roles=True)
+    async def rolebuttonstats(
+        self,
+        interaction: discord.Interaction,
+        role: Optional[discord.Role] = None,
+        show_users: Optional[bool] = False,
+    ):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
 
+        stats = _load_rolebtn_stats()
+        guild_stats = stats.get(str(interaction.guild.id), {})
+
+        if role is not None:
+            role_ids = [role.id]
+        else:
+            role_ids = []
+            for key in guild_stats.keys():
+                try:
+                    role_ids.append(int(key))
+                except ValueError:
+                    pass
+
+        if not role_ids:
+            return await interaction.response.send_message(
+                "아직 역할 버튼 통계가 없습니다.",
+                ephemeral=True,
+            )
+
+        lines: List[str] = ["📊 **역할 버튼 통계**"]
+
+        for role_id in role_ids:
+            active_ids, total_ids = get_rolebtn_stats(interaction.guild.id, role_id)
+            target_role = interaction.guild.get_role(role_id)
+
+            role_name = target_role.mention if target_role else f"`삭제된 역할({role_id})`"
+
+            lines.append(
+                f"\n• {role_name}\n"
+                f"  - 현재 버튼 등록 인원: **{len(active_ids)}명**\n"
+                f"  - 누적 버튼 사용 인원: **{len(total_ids)}명**"
+            )
+
+            if show_users and active_ids:
+                shown_users: List[str] = []
+
+                for user_id in active_ids[:50]:
+                    member = interaction.guild.get_member(user_id)
+                    shown_users.append(member.mention if member else f"`{user_id}`")
+
+                more = ""
+                if len(active_ids) > 50:
+                    more = f" 외 {len(active_ids) - 50}명"
+
+                lines.append(f"  - 현재 등록 유저: {', '.join(shown_users)}{more}")
+
+        message = "\n".join(lines)
+
+        if len(message) > 1900:
+            message = message[:1850] + "\n\n...표시할 내용이 많아서 일부만 표시했습니다."
+
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(RoleButtons(bot))
