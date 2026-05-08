@@ -309,12 +309,18 @@ def _build_embed(rule: dict[str, Any], *, message: Optional[discord.Message] = N
     image_url = _normalize_image_url(rule.get("image_url"))
 
     embed = discord.Embed(title=header, description=body, color=color)
+
     if message is not None:
-        embed.set_thumbnail(url=message.author.display_avatar.url)
+        target = _extract_target_user(message, rule)
+        thumbnail_user = target or message.author
+        embed.set_thumbnail(url=thumbnail_user.display_avatar.url)
+
     if image_url:
         embed.set_image(url=image_url)
+
     if footer:
         embed.set_footer(text=footer)
+
     return embed
 
 
