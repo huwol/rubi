@@ -535,11 +535,21 @@ class AutoResponder(commands.Cog):
         await interaction.response.send_modal(AutoResponseModal(self, rule, is_edit=False))
 
     @autoresponder.command(name="수정", description="기존 자동응답 내용을 수정합니다.")
-    @app_commands.describe(rule_id="/자동응답 목록에서 확인한 규칙 ID", response_type="응답 형식을 바꾸려면 선택합니다. 비워두면 기존 형식을 유지합니다.")
-    @app_commands.rename(rule_id="규칙id", response_type="응답형식")
+    @app_commands.describe(
+        rule_id="/자동응답 목록에서 확인한 규칙 ID",
+        trigger="새 트리거 문구입니다. 비워두면 기존 트리거를 유지합니다.",
+        response_type="응답 형식을 바꾸려면 선택합니다. 비워두면 기존 형식을 유지합니다.",
+    )
+    @app_commands.rename(rule_id="규칙id", trigger="트리거", response_type="응답형식")
     @app_commands.choices(response_type=RESPONSE_TYPE_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def edit(self, interaction: discord.Interaction, rule_id: str, response_type: Optional[app_commands.Choice[str]] = None):
+    async def edit(
+        self,
+        interaction: discord.Interaction,
+        rule_id: str,
+        trigger: Optional[str] = None,
+        response_type: Optional[app_commands.Choice[str]] = None,
+    ):
         if interaction.guild is None:
             return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
 
@@ -548,8 +558,16 @@ class AutoResponder(commands.Cog):
             return await interaction.response.send_message("해당 ID의 자동응답 규칙을 찾을 수 없습니다.", ephemeral=True)
 
         editable_rule = dict(rule)
+
+        if trigger is not None:
+            new_trigger = _normalize_text(trigger, fallback="", limit=100)
+            if not new_trigger:
+                return await interaction.response.send_message("트리거 문구를 입력해 주세요.", ephemeral=True)
+            editable_rule["trigger"] = new_trigger
+
         if response_type is not None:
             editable_rule["response_type"] = response_type.value
+
         await interaction.response.send_modal(AutoResponseModal(self, editable_rule, is_edit=True))
 
     @autoresponder.command(name="목록", description="등록된 자동응답 목록을 확인합니다.")
