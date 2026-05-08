@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import re
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -59,6 +60,12 @@ AUTORESPONDER_VARIABLES: tuple[tuple[str, str], ...] = (
     ("{message}", "유저가 작성한 메시지 내용입니다."),
     ("{trigger}", "자동응답 트리거 문구입니다."),
     ("{created_at}", "메시지 작성 시간입니다."),
+    ("{target}", "트리거 뒤에 입력된 첫 번째 멘션 유저를 표시합니다."),
+    ("{target_mention}", "트리거 뒤에 입력된 첫 번째 멘션 유저를 멘션 형태로 표시합니다. `{target}`과 같습니다."),
+    ("{target_username}", "멘션된 유저의 서버 닉네임입니다."),
+    ("{target_name}", "멘션된 유저의 디스코드 계정 이름입니다."),
+    ("{target_tag}", "멘션된 유저 태그 문자열입니다."),
+    ("{target_id}", "멘션된 유저 ID입니다."),
 )
 
 
@@ -138,7 +145,66 @@ def _safe_member_name(user: discord.abc.User) -> str:
 
 def _channel_name(channel: discord.abc.Messageable) -> str:
     return getattr(channel, "name", "알 수 없음")
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
+
+def _trigger_remainder(rule: dict[str, Any], content: str) -> str:
+    """메시지에서 트리거 뒤쪽에 남은 내용을 반환합니다."""
+    trigger = str(rule.get("trigger") or "").strip()
+    if not trigger:
+        return ""
+
+    content = content or ""
+
+    if rule.get("ignore_case", True):
+        trigger_cmp = trigger.casefold()
+        content_cmp = content.casefold()
+    else:
+        trigger_cmp = trigger
+        content_cmp = content
+
+    mode = str(rule.get("match_mode") or "contains")
+
+    if mode == "startswith":
+        if content_cmp.startswith(trigger_cmp):
+            return content[len(trigger):].strip()
+        return ""
+
+    if mode == "exact":
+        # 정확히 일치 모드는 원칙적으로 뒤 인자를 받을 수 없음.
+        # 예: "환영 @유저"는 "환영"과 정확히 일치하지 않기 때문.
+        return ""
+
+    # contains 모드
+    idx = content_cmp.find(trigger_cmp)
+    if idx < 0:
+        return ""
+    return content[idx + len(trigger):].strip()
+
+
+def _extract_target_user(message: Optional[discord.Message], rule: dict[str, Any]):
+    """트리거 뒤에 입력된 첫 번째 멘션 유저를 찾습니다."""
+    if message is None or message.guild is None:
+        return None
+
+    remainder = _trigger_remainder(rule, message.content or "")
+    if not remainder:
+        return None
+
+    match = _MENTION_RE.search(remainder)
+    if not match:
+        return None
+
+    try:
+        user_id = int(match.group(1))
+    except ValueError:
+        return None
+
+    for user in message.mentions:
+        if user.id == user_id:
+            return user
+
+    return message.guild.get_member(user_id)
 
 def _render_template(template: str, *, message: Optional[discord.Message], rule: dict[str, Any]) -> str:
     if message is None or message.guild is None:
@@ -155,6 +221,12 @@ def _render_template(template: str, *, message: Optional[discord.Message], rule:
             "{channel_name}": "channel",
             "{message}": rule.get("trigger") or "",
             "{trigger}": rule.get("trigger") or "",
+            "{target}": "@target",
+            "{target_mention}": "@target",
+            "{target_username}": "대상사용자",
+            "{target_name}": "target",
+            "{target_tag}": "target",
+            "{target_id}": "0",
             "{created_at}": "지금",
         }
     else:
@@ -162,6 +234,21 @@ def _render_template(template: str, *, message: Optional[discord.Message], rule:
         guild = message.guild
         channel = message.channel
         channel_mention = getattr(channel, "mention", f"#{_channel_name(channel)}")
+        target = _extract_target_user(message, rule)
+
+        if target is None:
+            target_mention = ""
+            target_username = ""
+            target_name = ""
+            target_tag = ""
+            target_id = ""
+        else:
+            target_mention = target.mention
+            target_username = _safe_member_name(target)
+            target_name = target.name
+            target_tag = str(target)
+            target_id = str(target.id)
+
         replacements = {
             "{mention}": author.mention,
             "{user}": author.mention,
@@ -175,6 +262,12 @@ def _render_template(template: str, *, message: Optional[discord.Message], rule:
             "{channel_name}": _channel_name(channel),
             "{message}": message.content,
             "{trigger}": str(rule.get("trigger") or ""),
+            "{target}": target_mention,
+            "{target_mention}": target_mention,
+            "{target_username}": target_username,
+            "{target_name}": target_name,
+            "{target_tag}": target_tag,
+            "{target_id}": target_id,
             "{created_at}": discord.utils.format_dt(message.created_at, style="F"),
         }
 
