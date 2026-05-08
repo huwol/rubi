@@ -17,9 +17,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.storage import DATA_DIR
+from utils.storage import DATA_DIR, load_json
 
 DB_PATH = Path(DATA_DIR / "leveling.db")
+TEMPVOICE_STATE = Path(DATA_DIR / "tempvoice_state.json")
 
 LIGHT_OUTLINE = (235, 238, 245)
 
@@ -431,6 +432,15 @@ class Leveling(commands.Cog):
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS no_xp_voice_hubs (
+                    guild_id INTEGER NOT NULL,
+                    hub_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, hub_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS level_rewards (
                     guild_id INTEGER NOT NULL,
                     level INTEGER NOT NULL,
@@ -501,6 +511,59 @@ class Leveling(commands.Cog):
             ).fetchone()
         return row is not None
 
+    def _is_no_xp_voice_hub(self, guild_id: int, hub_id: int) -> bool:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM no_xp_voice_hubs WHERE guild_id = ? AND hub_id = ?",
+                (guild_id, hub_id),
+            ).fetchone()
+        return row is not None
+
+    def _get_tempvoice_hub_id(self, guild_id: int, channel_id: int) -> Optional[int]:
+        """
+        tempvoice_state.json에서 현재 임시 음성방이 어느 허브에서 만들어졌는지 찾습니다.
+        일반 음성 채널이거나 기록이 없으면 None을 반환합니다.
+        """
+        try:
+            state = load_json(TEMPVOICE_STATE, {"created": {}, "counter": {}})
+        except Exception:
+            return None
+
+        created = state.get("created", {})
+        if not isinstance(created, dict):
+            return None
+
+        rec = created.get(str(channel_id))
+        if not isinstance(rec, dict):
+            return None
+
+        try:
+            if int(rec.get("guild_id", 0)) != int(guild_id):
+                return None
+
+            hub_id = rec.get("hub_id")
+            if hub_id is None:
+                return None
+
+            return int(hub_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _is_no_xp_voice_channel(self, guild_id: int, channel_id: int) -> bool:
+        """
+        음성 XP 제외 여부를 확인합니다.
+        1. 현재 채널 자체가 제외 허브로 등록된 경우 제외
+        2. tempvoice가 만든 임시방이고, 원본 허브가 제외 허브로 등록된 경우 제외
+        """
+        if self._is_no_xp_voice_hub(guild_id, channel_id):
+            return True
+
+        hub_id = self._get_tempvoice_hub_id(guild_id, channel_id)
+        if hub_id is None:
+            return False
+
+        return self._is_no_xp_voice_hub(guild_id, hub_id)
+
     def _has_no_xp_role(self, member: discord.Member) -> bool:
         role_ids = [role.id for role in member.roles]
         if not role_ids:
@@ -521,8 +584,14 @@ class Leveling(commands.Cog):
             return False
         if not _mode_allows(cfg.level_type, source):
             return False
-        if channel is not None and self._is_no_xp_channel(member.guild.id, channel.id):
-            return False
+        if channel is not None:
+            if self._is_no_xp_channel(member.guild.id, channel.id):
+                return False
+
+            if source == "voice" and isinstance(channel, discord.VoiceChannel):
+                if self._is_no_xp_voice_channel(member.guild.id, channel.id):
+                    return False
+
         if self._has_no_xp_role(member):
             return False
         return True
@@ -831,6 +900,10 @@ class Leveling(commands.Cog):
             for channel in guild.voice_channels:
                 if self._is_no_xp_channel(guild.id, channel.id):
                     continue
+
+                if self._is_no_xp_voice_channel(guild.id, channel.id):
+                    continue
+
                 for member in channel.members:
                     if not self._can_gain_xp(member, channel, "voice"):
                         continue
@@ -1170,6 +1243,10 @@ class Leveling(commands.Cog):
                 "SELECT role_id FROM no_xp_roles WHERE guild_id = ?",
                 (interaction.guild.id,),
             ).fetchall()
+            no_voice_hubs = conn.execute(
+                "SELECT hub_id FROM no_xp_voice_hubs WHERE guild_id = ?",
+                (interaction.guild.id,),
+            ).fetchall()
 
         no_channel_text = []
         for row in no_channels:
@@ -1181,6 +1258,11 @@ class Leveling(commands.Cog):
             role = interaction.guild.get_role(int(row["role_id"]))
             no_role_text.append(role.mention if role else f"삭제된 역할 `{row['role_id']}`")
 
+        no_voice_hub_text = []
+        for row in no_voice_hubs:
+            ch = interaction.guild.get_channel(int(row["hub_id"]))
+            no_voice_hub_text.append(ch.mention if hasattr(ch, "mention") else f"삭제된 허브 `{row['hub_id']}`")
+
         embed = discord.Embed(title="레벨 시스템 설정", color=discord.Color.blurple())
         embed.add_field(name="활성화", value="ON" if cfg.enabled else "OFF", inline=True)
         embed.add_field(name="집계 방식", value=cfg.level_type, inline=True)
@@ -1188,6 +1270,7 @@ class Leveling(commands.Cog):
         embed.add_field(name="음성 경험치", value=f"분당 {cfg.voice_xp_per_minute} XP", inline=False)
         embed.add_field(name="레벨업 채널", value=channel.mention if channel else "설정 안 됨", inline=False)
         embed.add_field(name="경험치 제외 채널", value="\n".join(no_channel_text) if no_channel_text else "없음", inline=False)
+        embed.add_field(name="경험치 제외 음성 허브", value="\n".join(no_voice_hub_text) if no_voice_hub_text else "없음", inline=False)
         embed.add_field(name="경험치 제외 역할", value="\n".join(no_role_text) if no_role_text else "없음", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1307,6 +1390,44 @@ class Leveling(commands.Cog):
             )
             conn.commit()
         await interaction.response.send_message(f"{channel.mention} 채널을 경험치 제외 채널에서 제거했습니다.", ephemeral=True)
+
+    @config.command(name="제외허브추가", description="이 허브에서 생성된 임시 음성방은 음성 경험치를 얻지 못하게 합니다.")
+    @app_commands.rename(hub="허브")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def config_no_xp_voice_hub_add(self, interaction: discord.Interaction, hub: discord.VoiceChannel):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        with self._db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO no_xp_voice_hubs (guild_id, hub_id) VALUES (?, ?)",
+                (interaction.guild.id, hub.id),
+            )
+            conn.commit()
+
+        await interaction.response.send_message(
+            f"{hub.mention} 허브에서 생성된 임시 음성방을 경험치 제외 대상으로 추가했습니다.",
+            ephemeral=True,
+        )
+
+    @config.command(name="제외허브제거", description="임시 음성방 경험치 제외 허브를 제거합니다.")
+    @app_commands.rename(hub="허브")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def config_no_xp_voice_hub_remove(self, interaction: discord.Interaction, hub: discord.VoiceChannel):
+        if interaction.guild is None:
+            return await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+
+        with self._db() as conn:
+            conn.execute(
+                "DELETE FROM no_xp_voice_hubs WHERE guild_id = ? AND hub_id = ?",
+                (interaction.guild.id, hub.id),
+            )
+            conn.commit()
+
+        await interaction.response.send_message(
+            f"{hub.mention} 허브를 경험치 제외 허브에서 제거했습니다.",
+            ephemeral=True,
+        )
 
     @config.command(name="제외역할추가", description="경험치를 얻지 못하는 역할을 추가합니다.")
     @app_commands.rename(role="역할")
