@@ -24,6 +24,7 @@ COG_EXTENSIONS: tuple[str, ...] = (
     "cogs.leveling",
     "cogs.member_counter",
     "cogs.welcome",
+    "cogs.autoresponder",
 )
 
 
